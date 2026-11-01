@@ -75,31 +75,45 @@ idêntico (mesma `Idempotency-Key` e mesmo corpo). A latência é medida no clie
 `/metrics` de cada instância (retentativas, locks esgotados, repetições). No fim, espera o outbox esvaziar e
 reconcilia todas as carteiras.
 
-**Resultados de referência.** Máquina de 2 vCPUs em que tudo divide a mesma CPU: as instâncias da API,
-o PostgreSQL 16, o MiniStack e o próprio gerador de carga. Bun 1.4.4, sem Docker.
+**Resultados.** Máquina de desenvolvimento Windows (x64), Processador 12th Gen Intel(R) Core(TM) i7-12700H (2.30 GHz), 32,0 GB de memória RAM, com tudo rodando no Docker Desktop na mesma
+máquina: as instâncias da API, o PostgreSQL 17 e o MiniStack. O gerador de carga roda fora do Docker, no
+mesmo computador. Bun 1.4.4. O ambiente foi zerado antes de cada cenário (`docker compose --profile app down -v`).
 
-| Cenário | Vazão | p50 | p95 | p99 | Erros | Outbox: maior atraso / esvaziou em |
-|---|---|---|---|---|---|---|
-| 1 instância, 20 carteiras | 552 req/s | 87 ms | 127 ms | 152 ms | 0% | 14,6 s / 35 s |
-| 3 instâncias, 20 carteiras | 387 req/s | 113 ms | 272 ms | 363 ms | 0% | 9,0 s / 13 s |
-| 3 instâncias, 2 carteiras (disputa) | 244 req/s | 166 ms | 494 ms | 812 ms | 0% | 1,8 s / 1 s |
+| Cenário | Pedidos | Vazão | p50 | p95 | p99 | máx | Erros |
+|---|---|---|---|---|---|---|---|
+| 1 instância, 20 carteiras | 18.463 | 922 req/s | 52 ms | 76 ms | 93 ms | 186 ms | 0% |
+| 3 instâncias, 20 carteiras | 33.078 | 1.651 req/s | 28 ms | 55 ms | 67 ms | 133 ms | 0% |
+| 3 instâncias, 2 carteiras (disputa) | 12.671 | 631 req/s | 58 ms | 235 ms | 443 ms | 925 ms | 0% |
 
-Em todos os cenários: 100% de respostas 201, todas as repetições respondidas como replay sem novo débito,
-nenhuma retentativa nem lock esgotado, e todas as carteiras consistentes na reconciliação.
+| Cenário | Outbox: maior atraso na carga | Esvaziou |
+|---|---|---|
+| 1 instância, 20 carteiras | 12,3 s | não, em 60 s (continuou publicando depois) |
+| 3 instâncias, 20 carteiras | 15,2 s | não, em 60 s (continuou publicando depois) |
+| 3 instâncias, 2 carteiras | 9,3 s | em 40 s após o fim |
+
+Em todos os cenários: 100% de respostas 201, todas as repetições respondidas como replay (sem novo débito),
+nenhuma retentativa, nenhum lock esgotado, nenhum 503, e todas as carteiras consistentes na reconciliação
+(saldo igual à soma do ledger).
 
 **Análise:**
-- **3 instâncias não aumentam a vazão aqui** porque não há CPU livre: com 2 vCPUs, mais processos só
-  disputam o mesmo processador e pioram a cauda (p99). O ganho horizontal aparece com instâncias em
-  máquinas separadas. O que este teste mostra é a correção com várias instâncias, não a escala.
-- **Disputa pela mesma carteira:** com 2 carteiras, 25 trabalhadores esperam o lock de cada uma.
-  O lock por carteira serializa essas operações: a vazão cai pela metade e o p99 passa de 800 ms,
-  mas nenhum pedido estourou o `LOCK_TIMEOUT_MS` (5 s). Carteiras diferentes não se bloqueiam.
-- **O outbox atrasa por causa do MiniStack, não do banco:** medido à parte, o emulador aceita cerca de
-  200 mensagens/s mesmo com `SendMessageBatch`, e cada BET gera 2 eventos. Com 500 req/s, a fila de eventos
-  não acompanha durante a carga e esvazia depois, sem perder nenhum evento. No cenário de disputa, com menos
-  BETs por segundo, o atraso fica abaixo de 2 s. Contra o SQS real, o limite seria outro e precisaria ser medido.
-- **Limites desta medição:** uma única máquina pequena, emulador no lugar do SQS e execuções curtas de 20 s
-  (sem aquecimento separado). Servem para comparar cenários entre si, não como capacidade de produção.
+- **Escala horizontal:** de 1 para 3 instâncias, a vazão sobe 1,8× (922 → 1.651 req/s) e a latência cai
+  (p50 de 52 para 28 ms, p99 de 93 para 67 ms). Não chega a 3× porque as instâncias dividem a mesma CPU e o
+  mesmo PostgreSQL; o banco passa a ser o recurso compartilhado.
+- **Disputa pela mesma carteira:** com 2 carteiras para 50 trabalhadores, cerca de 25 pedidos esperam o lock
+  de cada carteira. O lock por carteira serializa essas operações: a vazão cai para 631 req/s (38% do
+  cenário com 20 carteiras) e a cauda cresce (p99 de 443 ms, máximo de 925 ms). Mesmo assim, nenhum pedido
+  estourou o `LOCK_TIMEOUT_MS` (5 s), e a correção se mantém. É o custo esperado do lock pessimista:
+  carteiras quentes ficam mais lentas, carteiras diferentes não se afetam.
+- **Outbox e MiniStack:** cada BET novo gera 2 eventos (`WagerTransactionProcessed` e
+  `WalletBalanceChanged`), ou seja, cerca de 3.000 eventos/s no cenário de 3 instâncias. O MiniStack aceita
+  algumas centenas por segundo (cerca de 200/s medidos à parte com `SendMessageBatch`), então a fila de
+  eventos cresce durante a carga e continua sendo publicada depois. Nenhum evento se perde: eles ficam em
+  `outbox_events` até serem aceitos. No cenário de disputa, com menos BETs por segundo, a fila esvazia em
+  40 s. Contra o SQS real, o limite seria outro e precisaria ser medido; com o emulador, o atraso do outbox
+  mede o emulador, não o serviço.
+- **Limites desta medição:** uma única máquina para tudo (API, banco, emulador e gerador de carga),
+  emulador no lugar do SQS e execuções curtas de 20 s, sem aquecimento separado. Os números servem para
+  comparar cenários entre si, não como capacidade de produção.
 
 ## Endpoints
 

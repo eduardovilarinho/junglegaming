@@ -38,6 +38,7 @@ async function criarCarteiras(): Promise<Carteira[]> {
     for (let i = 0; i < quantidadeDeCarteiras; i++) {
         const playerId = "load-" + Date.now().toString(36) + "-" + i;
         const r = await fetch(urlDaVez() + "/wallets", {
+            signal: AbortSignal.timeout(10_000),
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ playerId, initialBalance: { amount: "1000000.00", currency: "BRL" } }),
@@ -83,7 +84,20 @@ async function maiorAtrasoDoOutbox(): Promise<number> {
     return maior;
 }
 
+/** Confere se cada instância responde antes de começar; sem isso, um fetch para uma porta parada pode ficar esperando */
+async function conferirInstancias(): Promise<void> {
+    for (const url of urls) {
+        try {
+            const r = await fetch(url + "/health/ready", { signal: AbortSignal.timeout(5000) });
+            if (r.status !== 200) throw new Error("respondeu " + r.status + " " + (await r.text()));
+        } catch (erro: unknown) {
+            throw new Error(url + " não está pronta (" + (erro instanceof Error ? erro.message : String(erro)) + "). A API está no ar?");
+        }
+    }
+}
+
 async function executar(): Promise<void> {
+    await conferirInstancias();
     console.log("Preparando " + quantidadeDeCarteiras + " carteiras em " + urls.join(", ") + "...");
     const carteiras = await criarCarteiras();
     const antes = {
