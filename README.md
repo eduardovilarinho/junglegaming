@@ -52,7 +52,7 @@ bun run test:multi            # 3 instâncias da API + PostgreSQL + MiniStack re
 | `test/app.e2e.spec.ts`, `test/zitadel-validador.spec.ts` | autenticação, health, métricas, tradução das claims do Zitadel | nenhuma |
 | `test/integration/financeiro` | constraints do schema (inclusive a aritmética do ledger), atomicidade, idempotência e saldo devolvido na repetição, inbox, **50 BETs idênticos em paralelo**, **saldo 100.00 com dois BETs simultâneos de 80.00**, disputa na mesma carteira, carteiras em paralelo, reversões concorrentes, referência fora de ordem, workers concorrentes, outbox com publicadores concorrentes e falha parcial no lote, paginação, reconciliação | PostgreSQL |
 | `test/integration/http` | contrato HTTP (formato do enunciado): status, `Idempotency-Key`, `idempotentReplay` com o saldo original, 409, 422, 202, 404, cursor, reconciliação, provider do token | PostgreSQL |
-| `test/integration/multi-instancia` | 3 processos da API: BETs idênticos e disputa entre instâncias, fila com duplicatas (mesmo `messageId` e reenvio) e fora de ordem, **processo morto depois do commit e antes do ack**, reinício, mensagem inválida na DLQ, eventos publicados sem repetição | PostgreSQL + MiniStack |
+| `test/integration/multi-instancia` | 3 processos da API: BETs idênticos e disputa entre instâncias, fila com duplicatas (mesmo `messageId` e reenvio) e fora de ordem, **processo morto depois do commit e antes do ack**, reinício, falha passageira (lock esgotado) devolvida à fila com backoff e aplicada uma vez, **SIGTERM com mensagem em curso**, mensagem inválida na DLQ, eventos publicados sem repetição | PostgreSQL + MiniStack |
 
 Todo teste de integração termina conferindo o invariante final: o saldo de cada carteira é igual ao
 saldo reconstruído a partir do ledger.
@@ -75,7 +75,7 @@ idêntico (mesma `Idempotency-Key` e mesmo corpo). A latência é medida no clie
 `/metrics` de cada instância (retentativas, locks esgotados, repetições). No fim, espera o outbox esvaziar e
 reconcilia todas as carteiras.
 
-**Resultados.** Máquina de desenvolvimento Windows (x64), Processador 12th Gen Intel(R) Core(TM) i7-12700H (2.30 GHz), 32,0 GB de memória RAM, com tudo rodando no Docker Desktop na mesma
+**Resultados.** Máquina de desenvolvimento Windows (x64), com tudo rodando no Docker Desktop na mesma
 máquina: as instâncias da API, o PostgreSQL 17 e o MiniStack. O gerador de carga roda fora do Docker, no
 mesmo computador. Bun 1.4.4. O ambiente foi zerado antes de cada cenário (`docker compose --profile app down -v`).
 

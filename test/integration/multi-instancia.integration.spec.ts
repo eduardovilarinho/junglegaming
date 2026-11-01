@@ -107,6 +107,44 @@ describe.skipIf(!HABILITADO)("várias instâncias + SQS", () => {
         return JSON.stringify({ messageId, type: "WagerTransactionRequested", occurredAt: new Date().toISOString(), data: dados });
     }
 
+    /** Soma uma métrica (todas as séries) no /metrics de uma instância */
+    async function metrica(porta: number, nome: string): Promise<number> {
+        const texto = await (await fetch("http://localhost:" + porta + "/metrics")).text();
+        return texto
+            .split("\n")
+            .filter((l) => l.startsWith(nome + " ") || l.startsWith(nome + "{"))
+            .reduce((total, l) => total + Number(l.split(" ").at(-1)), 0);
+    }
+
+    /**
+     * Segura o lock da carteira numa transação do próprio teste, como uma operação lenta faria.
+     * Devolve a função que solta o lock (commit). Enquanto isso, quem processar essa carteira espera.
+     */
+    async function travarCarteira(walletId: string): Promise<() => Promise<void>> {
+        let soltar: () => void = () => undefined;
+        const liberado = new Promise<void>((r) => (soltar = r));
+        let travou: () => void = () => undefined;
+        const travado = new Promise<void>((r) => (travou = r));
+        const transacao = banco.sql.begin(async (tx) => {
+            await tx.unsafe("select id from wallets where id = $1 for update", [walletId]);
+            travou();
+            await liberado;
+        });
+        await travado;
+        return async () => {
+            soltar();
+            await transacao;
+        };
+    }
+
+    async function lancamentosDe(externalTransactionId: string): Promise<number> {
+        const [l] = await banco.sql.unsafe(
+            "select count(*)::int as n from ledger_entries l join wager_transactions t on t.id = l.transaction_id where t.external_transaction_id = $1",
+            [externalTransactionId]
+        );
+        return (l as { n: number }).n;
+    }
+
     async function saldo(walletId: string): Promise<string> {
         const [l] = await banco.sql.unsafe("select balance::text as b from wallets where id = $1", [walletId]);
         return String((l as { b: string }).b);
@@ -232,6 +270,69 @@ describe.skipIf(!HABILITADO)("várias instâncias + SQS", () => {
             [bet.externalTransactionId]
         );
         expect(lancamentos).toEqual({ n: 1 });
+    }, 90_000);
+
+    it("falha passageira (lock esgotado) devolve a mensagem à fila com backoff e ela é aplicada uma vez depois", async () => {
+        // Uma instância com lock_timeout curto, para a espera pelo lock virar falha passageira rápido
+        await Promise.all(instancias.map(derrubar));
+        instancias = [await subir(3106, { LOCK_TIMEOUT_MS: "300" })];
+        const c = await criarCarteira(3106, "10.00");
+        const bet = aposta(c, "BET", "2.00");
+
+        const soltar = await travarCarteira(c.id);
+        try {
+            await sqs.send(new SendMessageCommand({
+                QueueUrl: await urlDa(filas.filaDeTransacoes),
+                MessageBody: envelope(bet),
+                MessageGroupId: c.id,
+                MessageDeduplicationId: crypto.randomUUID(),
+            }));
+            // A instância tenta, estoura o lock_timeout (3 vezes, com retentativa interna) e devolve a mensagem
+            await esperar(async () => (await metrica(3106, "wager_lock_conflicts_total")) >= 1);
+            await esperar(async () => (await metrica(3106, "wager_retries_total{reason=\"queue-transient\"}")) >= 1);
+            expect(await saldo(c.id)).toBe("1000"); // nada aplicado enquanto o lock está preso
+        } finally {
+            await soltar();
+        }
+
+        // Depois do backoff, a mensagem volta e é aplicada exatamente uma vez
+        await esperar(async () => (await saldo(c.id)) === "800");
+        await Bun.sleep(1500);
+        expect(await saldo(c.id)).toBe("800");
+        expect(await lancamentosDe(bet.externalTransactionId)).toBe(1);
+    }, 90_000);
+
+    it("SIGTERM termina a mensagem em curso, devolve as outras, e o reinício não duplica nada", async () => {
+        await Promise.all(instancias.map(derrubar));
+        const instancia = await subir(3107);
+        instancias = [instancia];
+        const c = await criarCarteira(3107, "50.00");
+        const bets = Array.from({ length: 6 }, () => aposta(c, "BET", "1.00"));
+
+        // Com o lock preso, a primeira mensagem fica em processamento (esperando o lock) e as outras na fila
+        const soltar = await travarCarteira(c.id);
+        const url = await urlDa(filas.filaDeTransacoes);
+        for (const b of bets) {
+            await sqs.send(new SendMessageCommand({
+                QueueUrl: url, MessageBody: envelope(b), MessageGroupId: c.id, MessageDeduplicationId: crypto.randomUUID(),
+            }));
+        }
+        await Bun.sleep(1500); // tempo para a instância receber o lote e começar a primeira
+
+        // SIGTERM com a mensagem em curso; o processo espera ela terminar antes de sair
+        instancia.processo.kill(15);
+        await Bun.sleep(500);
+        expect(instancia.processo.exitCode).toBeNull(); // ainda vivo: esperando a mensagem em curso
+        await soltar();
+        await instancia.processo.exited;
+        instancias = [];
+
+        // Um processo novo pega o que foi devolvido; cada BET é aplicado exatamente uma vez
+        instancias = [await subir(3101)];
+        await esperar(async () => (await saldo(c.id)) === "4400");
+        await Bun.sleep(1500);
+        expect(await saldo(c.id)).toBe("4400");
+        for (const b of bets) expect(await lancamentosDe(b.externalTransactionId)).toBe(1);
     }, 90_000);
 
     it("mensagem inválida vai para a DLQ com o motivo, sem efeito no saldo", async () => {
