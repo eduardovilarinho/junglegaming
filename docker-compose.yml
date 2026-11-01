@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: jungle_gaming-postgres
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: jungle_gaming
+    ports:
+      - "5432:5432"
+    volumes:
+      - dados-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jungle_gaming"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # SQS local. MiniStack: gratuito, sem conta nem token (o LocalStack passou a exigir conta em 2026).
+  sqs:
+    image: ministackorg/ministack:latest
+    container_name: jungle_gaming-sqs
+    environment:
+      MINISTACK_REGION: us-east-1
+    ports:
+      - "4566:4566"
+
+  # ---- Perfil "app": a API em 3 instâncias (docker compose --profile app up --build) ----
+
+  # Prepara banco e filas uma vez, antes das instâncias
+  setup:
+    profiles: ["app"]
+    build: .
+    # O MiniStack leva alguns segundos para aceitar conexões depois de iniciar: tenta criar as filas até 15 vezes
+    command: ["sh", "-c", "bun run db:migrate && for i in $$(seq 1 15); do bun run sqs:setup && exit 0; sleep 2; done; exit 1"]
+    environment: &ambiente
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/jungle_gaming
+      SQS_ENDPOINT: http://sqs:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AUTH_MODE: disabled
+      WORKERS_ENABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sqs:
+        condition: service_started
+
+  api-1: &api
+    profiles: ["app"]
+    build: .
+    environment: *ambiente
+    ports:
+      - "3001:3000"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  api-2:
+    <<: *api
+    ports:
+      - "3002:3000"
+
+  api-3:
+    <<: *api
+    ports:
+      - "3003:3000"
+
+volumes:
+  dados-postgres:

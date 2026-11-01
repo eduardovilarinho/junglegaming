@@ -1,0 +1,4 @@
+# Scripts do package.json rodam no shell do próprio Bun em todos os sistemas
+# (assim "INTEGRATION=1 bun test" funciona também no Windows)
+[run]
+shell = "bun"
